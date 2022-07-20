@@ -1,0 +1,320 @@
+from Datasets.pipelines.Spark.base.sessionbuilder import SparkSessionManager
+from Datasets.pipelines.Spark.base.dataset import *
+from pyspark.sql import functions as f
+from pyspark.sql.types import *
+import pandas as pd
+import numpy as np
+import calendar
+import pendulum
+import cx_Oracle
+import sys
+import os
+import time
+from datetime import date, datetime, timedelta
+from dateutil.relativedelta import relativedelta
+from Utils.config_wrapper.wrapper import BaseHookWrapper, VariableWrapper
+
+
+def pos_agency_monthly_results():
+    con = BaseHookWrapper.get_connection("analytic")
+    ip = '10.1.69.143'
+    port = 1579
+    SID = 'analytic'
+
+    dsn_tns = cx_Oracle.makedsn(ip, port, SID)
+    conn = cx_Oracle.connect(con.login, con.password, dsn_tns)
+
+    # agent details
+    agents = f"""select substr(a.ADD_INFO_03, 0,3) as Branch, 
+                b.client_number as Agent_Code,
+                b.trade_nam as Agency_Name,
+                contract_number as Terminal_Id, 
+                b.first_nam || ' ' || b.last_nam as Agent_Name,
+                b.phone as Agency_Contact,
+                REPLACE ( (b.client_number), 'AG', '') as Agent_ID,
+                substr(a.ADD_INFO_03, 0,14) as Outlet_Code, 
+                rbs_number as Transacting_Acc,
+                a.ADD_INFO_02 as Commission_Acc
+                from ANALYTICS_STG.STG_WAY4_CONTRACT a,
+                ANALYTICS_STG.STG_WAY4_CLIENT b 
+                where a.amnd_state = 'A'
+                and b.amnd_state = 'A'
+                and a.client__id = b.id
+                and a.client_type in( '1879', '1883', '1881')
+                and a.MERCHANT_ID in('6010')
+                and a.f_i = '717'
+                and a.contract_number not like '%-C-%'
+                """
+    agent_details = pd.read_sql(agents, conn)
+    ###############################
+    a = datetime.now().date() - timedelta(days=1)
+    b = a.replace(day=1)
+    end_month = b.replace(day=calendar.monthrange(b.year, b.month)[1])
+    end_month = end_month.strftime('%Y-%m-%d')
+    dates = pd.date_range(end=end_month, periods=4, freq='M')
+    date = dates
+
+    def zero_pad(v):
+        return "0"+str(v) if v < 10 else str(v)
+
+    df = []
+    for date in dates:
+        start = time.time()
+
+        if date == pd.to_datetime(end_month):
+            tran_table = f"STATS@edw"
+        else:
+            tran_table = f"STATS_P{date.year}{'0'+str(date.month) if date.month < 10 else str(date.month)}"+"@edw"
+
+        query = f"""
+                select PSTD_DATE,TRAN_DATE,tran_id, foracid,SCHM_CODE, CUST_ID, REF_AMT,ACCT_NAME,
+                    TRAN_PARTICULAR, TRAN_PARTICULAR_2 TID,PART_TRAN_TYPE
+                    from {tran_table}
+                    WHERE SCHM_TYPE in ('SBA','CAA') and
+                    length(TRAN_PARTICULAR_2) = 8 
+                    and (TRAN_PARTICULAR LIKE '%CASH DEPOSIT/%' or TRAN_PARTICULAR  LIKE '%T-BY:%' 
+                    or TRAN_PARTICULAR  LIKE '%C-BY:%' or TRAN_PARTICULAR  LIKE '%BPAY:%' or TRAN_PARTICULAR LIKE '%CASH ADVANCE/%')
+                                            
+            """
+        dfs = pd.DataFrame()
+        data = pd.read_sql(query, conn)
+        df.append(data)
+        agents_pos = pd.concat(df, ignore_index=True)
+        end = time.time()
+        print(date, end-start)
+
+    agents_trans1 = agents_pos
+    agents_trans1.columns
+    agents_trans1 = agents_pos[['TRAN_DATE', 'FORACID', 'CUST_ID',
+                                'REF_AMT', 'ACCT_NAME', 'TID', 'PART_TRAN_TYPE']]
+    agents_trans1['transaction_type'] = np.where(agents_trans1['PART_TRAN_TYPE'] == 'D',
+                                                 'deposits', np.where(agents_trans1['PART_TRAN_TYPE'] == 'C',
+                                                                      'withdrawals', agents_trans1['PART_TRAN_TYPE']))
+
+    mydate = datetime.now().date() - timedelta(days=1)
+    x = mydate.replace(day=1)
+    last_date_of_month = x.replace(day=calendar.monthrange(x.year, x.month)[1])
+
+    month_end = last_date_of_month
+    month_start = month_end - timedelta(days=(month_end.day-1))
+    window3 = month_start - pd.DateOffset(months=3)
+
+    agents_max_min = agents_trans1[(agents_trans1.TRAN_DATE <= month_end) & (
+        agents_trans1.TRAN_DATE >= window3)]
+    agents_max_min = agents_max_min.groupby(
+        'TID').agg({'TRAN_DATE': [np.min, np.max]})
+    agents_max_min.columns = [
+        'First Trx Day in last 90 days', 'Most Recent Trx Day in last 90 days']
+    agents_max_min = agents_max_min.reset_index()
+    agents_max_min['First Trx Day in last 90 days'] = agents_max_min['First Trx Day in last 90 days'].dt.date
+    agents_max_min['Most Recent Trx Day in last 90 days'] = agents_max_min['Most Recent Trx Day in last 90 days'].dt.date
+
+    agents_trans2 = agents_trans1
+
+    agents_trans2 = agents_trans2.rename(columns={'REF_AMT': 'AMOUNT'})
+
+    agents_thismonth = agents_trans2[(agents_trans2.TRAN_DATE <= month_end) & (
+        agents_trans2.TRAN_DATE >= month_start)]
+
+    agents_thismonth_agg = agents_thismonth.groupby(
+        ['TID']).size().reset_index(name='TOTAL_TRX')
+
+    data5 = pd.pivot_table(data=agents_thismonth, index=[
+                           'TID'], columns='transaction_type', values='AMOUNT', aggfunc=['sum', 'min', 'max']).reset_index()
+    data5.columns = ["_".join(x) for x in data5.columns.ravel()]
+    data5.columns = ['TID', 'CURR_TOTAL_DEPOSITS', 'CURR_TOTAL_WITH',
+                     'CURR_MIN_AMT_DEP', 'CURR_MIN_AMT_WITH', 'CURR_MAX_AMT_DEP', 'CURR_MAX_AMT_WITH']
+
+    agents_thismonth_agg1 = pd.merge(
+        agents_thismonth_agg, data5, on='TID', how='inner')
+    agents_thismonth_agg1 = agents_thismonth_agg1.rename(
+        columns={'TID': 'TID_FOR_THISmonth'})
+
+    agents_beforethismonth = agents_trans2[(
+        agents_trans2.TRAN_DATE < month_start) & (agents_trans2.TRAN_DATE >= window3)]
+    agents_beforethismonth["POSTING_month"] = agents_beforethismonth["TRAN_DATE"].dt.month
+
+    agents_beforethismonth_agg1 = agents_beforethismonth.groupby(
+        ['TID']).agg({'POSTING_month': lambda x: x.nunique()}).reset_index()
+    agents_beforethismonth_agg1.columns = ['TID', 'TOTAL_monthS_ACTIVE']
+
+    data6 = pd.pivot_table(data=agents_beforethismonth, index=[
+                           'TID'], columns='transaction_type', values='AMOUNT', aggfunc=['sum', 'min', 'max'])
+    data6.columns = ["_".join(x) for x in data6.columns.ravel()]
+    data6 = data6.reset_index()
+    data6.columns = ['TID', 'PREV_TOTAL_DEPOSITS', 'PREV_TOTAL_WITH',
+                     'PREV_MIN_AMT_DEP', 'PREV_MIN_AMT_WITH', 'PREV_MAX_AMT_DEP', 'PREV_MAX_AMT_WITH']
+
+    agents_beforethismonth_agg2 = pd.merge(
+        agents_beforethismonth_agg1, data6, on='TID', how='inner')
+    agents_beforethismonth_agg2['AVG_monthLY_DEPOSITS'] = agents_beforethismonth_agg2['PREV_TOTAL_DEPOSITS'] / \
+        agents_beforethismonth_agg2['TOTAL_monthS_ACTIVE']
+    agents_beforethismonth_agg2['AVG_monthLY_WITHDRAWALS'] = agents_beforethismonth_agg2['PREV_TOTAL_WITH'] / \
+        agents_beforethismonth_agg2['TOTAL_monthS_ACTIVE']
+
+    summary1 = pd.merge(agents_beforethismonth_agg2, agents_thismonth_agg1,
+                        left_on='TID', right_on='TID_FOR_THISmonth', how='outer')
+
+    agency_monthly_results = pd.merge(
+        summary1, agents_max_min, on='TID', how='right')
+    agency_monthly_results2 = agency_monthly_results[~agency_monthly_results['TOTAL_monthS_ACTIVE'].isna(
+    )]
+    agency_monthly_results3 = agency_monthly_results2[agency_monthly_results2['TID_FOR_THISmonth'].isna(
+    )]
+
+    agency_monthly_results3 = agency_monthly_results3[['TID', 'TOTAL_monthS_ACTIVE', 'PREV_TOTAL_DEPOSITS',
+                                                       'PREV_TOTAL_WITH', 'PREV_MIN_AMT_DEP', 'PREV_MIN_AMT_WITH',
+                                                       'PREV_MAX_AMT_DEP', 'PREV_MAX_AMT_WITH', 'AVG_monthLY_DEPOSITS',
+                                                       'AVG_monthLY_WITHDRAWALS', 'First Trx Day in last 90 days',
+                                                       'Most Recent Trx Day in last 90 days']]
+
+    months_active_col = f'Number of months active before {month_start.isoformat()}'
+    totalinmonthincol = f'Total deposits amount between {window3.isoformat()} and {month_start.isoformat()}'
+    totaloutmonthoutcol = f'Total withdrawn amount between {window3.isoformat()} and {month_start.isoformat()}'
+    min_inmonthincol = f'Minimum deposits amount between {window3.isoformat()} and {month_start.isoformat()}'
+    min_outmonthoutcol = f'Minimum withdrawn amount between {window3.isoformat()} and {month_start.isoformat()}'
+    max_inmonthincol = f'Maximum deposits amount between {window3.isoformat()} and {month_start.isoformat()}'
+    max_outmonthoutcol = f'Maximum withdrawn amount between {window3.isoformat()} and {month_start.isoformat()}'
+    avgmonthincol = f'monthly Average deposited amount between {window3.isoformat()} and {month_start.isoformat()}'
+    avgmonthoutcol = f'monthly Average withdrawn amount between {window3.isoformat()} and {month_start.isoformat()}'
+
+    mx_tran_date = f'Most Recent Trx Day in last 90 days'
+    mn_tran_date = f'First Trx Day in last 90 days'
+
+    columns = ['TID', months_active_col, totalinmonthincol, totaloutmonthoutcol, min_inmonthincol,
+               min_outmonthoutcol, max_inmonthincol, max_outmonthoutcol, avgmonthincol, avgmonthoutcol,
+               mn_tran_date, mx_tran_date]
+
+    agency_monthly_results3.columns = columns
+
+    agents_details1 = agent_details
+
+    agency_month_results5 = pd.merge(agency_monthly_results3, agents_details1[[
+                                     'BRANCH', 'AGENT_CODE', 'AGENCY_NAME', 'AGENT_NAME', 'TRANSACTING_ACC', 'TERMINAL_ID', 'OUTLET_CODE']], left_on='TID', right_on='TERMINAL_ID', how='left')
+
+    agency_month_results5 = agency_month_results5[['TRANSACTING_ACC', 'BRANCH', 'AGENT_CODE', 'AGENCY_NAME', 'AGENT_NAME', 'OUTLET_CODE',
+                                                   'TERMINAL_ID', months_active_col, totalinmonthincol, totaloutmonthoutcol, min_inmonthincol,
+                                                   min_outmonthoutcol, max_inmonthincol, max_outmonthoutcol, avgmonthincol, avgmonthoutcol,
+                                                   mn_tran_date, mx_tran_date]]
+
+    not_exists = agency_month_results5.loc[agency_month_results5['AGENT_CODE'].isnull(
+    )]
+    not_exists.to_csv(
+        '/home/user/project/Projects/Agency/Dormancy/null_agents_code.csv')
+
+    not_exists_TID = agency_month_results5.loc[agency_month_results5['TRANSACTING_ACC'].isnull(
+    )]
+    not_exists_TID.to_csv(
+        '/home/user/project/Projects/Agency/Dormancy/null_TIDs.csv')
+
+    agency_month_results5 = agency_month_results5.loc[~agency_month_results5['TRANSACTING_ACC'].isnull(
+    )]
+
+    agency_month_results6 = agency_month_results5
+
+    # gam
+    branches = agency_month_results6.loc[agency_month_results6['BRANCH'].isnull(
+    )]
+
+    if branches.empty:
+        print('dataframe is empty')
+    else:
+        trans_acc = tuple(branches['TRANSACTING_ACC'].unique().tolist())
+        gam_branch = f"""select sol_id, foracid,acct_name,cust_id,schm_code from ugedw.stg_gam@edw
+                        where foracid in {trans_acc}"""
+        gam = pd.read_sql(gam_branch, conn)
+        y = pd.merge(agency_month_results6, gam,
+                     left_on='TRANSACTING_ACC', right_on='FORACID', how='left')
+        agency_month_results6['BRANCH'] = np.where(
+            agency_month_results6['BRANCH'].isnull(), y['SOL_ID'], agency_month_results6['BRANCH'])
+
+    branch_emails = pd.read_excel(
+        '/home/user/project/Projects/Agency/Dormancy/2020_MAY_BRANCH-AGENCY_TEAM.xlsx')
+    branch_emails = branch_emails.rename(columns={'SOL': 'BRANCH_ID'})
+    branch_emails = branch_emails[['BRANCH_ID', 'Branch', 'Region', 'PF', 'Email address',
+                                   'BGDM', 'OPS']]
+    branch_emails.columns = ['BRANCH_ID', 'BRANCH', 'REGION',
+                             'PF', 'STAFF_EMAIL', 'BGDM_EMAIL', 'OPS_EMAIL']
+    branch_emails['BRANCH_ID'] = np.where(
+        branch_emails['BRANCH'] == 'Emali', 181.0, branch_emails['BRANCH_ID'])
+    branch_emails = branch_emails.dropna(subset=['BRANCH_ID'])
+    branch_emails['BRANCH_ID'] = branch_emails['BRANCH_ID'].astype(int)
+
+    def zero_pad(x):
+        if x < 10:
+            return '00'+str(x)
+        elif 10 <= x < 100:
+            return '0'+str(x)
+        else:
+            return str(x)
+    branch_emails['BRANCH_ID'] = branch_emails['BRANCH_ID'].apply(
+        lambda x: zero_pad(x))
+
+    regional_managers = pd.read_csv(
+        "/home/user/project/Projects/Merchant/dormancyreports/rm_list.csv")
+
+    regional_managers['SOL'] = [x[:3] for x in regional_managers['BRANCH']]
+    regional_managers = regional_managers[['SOL', 'BRANCH', 'RM', 'RM_EMAIL']]
+    regional_managers['SOL'] = regional_managers['SOL'].astype(int)
+
+    def zero_pad(x):
+        if x < 10:
+            return '00'+str(x)
+        elif 10 <= x < 100:
+            return '0'+str(x)
+        else:
+            return str(x)
+    regional_managers['SOL'] = regional_managers['SOL'].apply(
+        lambda x: zero_pad(x))
+
+    regional_managers.columns = ['BRANCH_ID', 'BRANCH', 'RM', 'RM_EMAIL']
+
+    managers_info = pd.merge(branch_emails, regional_managers[[
+                             'BRANCH_ID', 'RM', 'RM_EMAIL']], on='BRANCH_ID', how='outer')
+    managers_info = managers_info.drop_duplicates(subset='BRANCH_ID')
+    managers_info = managers_info.loc[~managers_info['BRANCH_ID'].isnull()]
+
+    agency_month_results6['BRANCH'] = agency_month_results6['BRANCH'].str.strip(
+        "'")
+    agency_month_results6['BRANCH'] = agency_month_results6['BRANCH'].str.strip(
+        "-")
+    agency_month_results6['BRANCH'] = agency_month_results6['BRANCH'].astype(int)
+
+    def zero_pad(x):
+        if x < 10:
+            return '00'+str(x)
+        elif 10 <= x < 100:
+            return '0'+str(x)
+        else:
+            return str(x)
+
+    agency_month_results6['BRANCH'] = agency_month_results6['BRANCH'].apply(
+        lambda x: zero_pad(x))
+
+    agency_month_results6 = agency_month_results6.rename(
+        columns={'BRANCH': 'BRANCH_ID'})
+
+    agents_monthly_results6 = pd.merge(
+        agency_month_results6, managers_info, on='BRANCH_ID', how='left')
+
+    # gam
+    branchID = agents_monthly_results6.loc[agents_monthly_results6['BRANCH'].isnull(
+    )]
+
+    if branchID.empty:
+        print('dataframe is empty')
+    else:
+        ids_branch = f"""select SOL_ID,SOL_DESC from ugedw.stg_sol@edw
+                """
+        ids_branch = pd.read_sql(ids_branch, conn)
+        ids_branch['SOL_ID'] = ids_branch['SOL_ID'].dropna()
+
+        y = pd.merge(agents_monthly_results6, ids_branch,
+                     left_on='BRANCH_ID', right_on='SOL_ID', how='left')
+        agents_monthly_results6['BRANCH'] = np.where(agents_monthly_results6['BRANCH'].isnull(
+        ), y['SOL_DESC'], agents_monthly_results6['BRANCH'])
+
+    agents_monthly_results6['BRANCH'] = agents_monthly_results6['BRANCH'].str.lower(
+    )
+
+    return agents_monthly_results6
